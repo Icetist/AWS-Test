@@ -18,6 +18,7 @@ dynamodb = boto3.resource('dynamodb', region_name='us-west-2')
 ses = boto3.client('ses', region_name='us-west-2')
 table = dynamodb.Table('tt-saahil-users')
 otp_table = dynamodb.Table('tt-saahil-otps')
+hsc_table = dynamodb.Table('tt-saahil-hsc-pass-rates')
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -85,7 +86,7 @@ def send_otp():
     email = data.get('email', '').strip().lower()
     purpose = data.get('purpose', '')
 
-    if not email or purpose not in ('signup', 'login', 'password-change'):
+    if not email or purpose not in ('signup', 'login', 'password-change', 'password-reset'):
         return jsonify({'error': 'Invalid request'}), 400
 
     if purpose == 'signup':
@@ -93,7 +94,7 @@ def send_otp():
         if existing.get('Items'):
             return jsonify({'error': 'An account with this email already exists'}), 409
 
-    if purpose in ('login', 'password-change'):
+    if purpose in ('login', 'password-change', 'password-reset'):
         existing = table.scan(FilterExpression=Attr('email').eq(email))
         if not existing.get('Items'):
             return jsonify({'error': 'No account found with this email'}), 404
@@ -120,6 +121,7 @@ def send_otp():
         'signup': 'Sign Up',
         'login': 'Login',
         'password-change': 'Password Change',
+        'password-reset': 'Password Reset',
     }
 
     try:
@@ -269,6 +271,73 @@ def update_user(user_id):
     )
 
     return jsonify({'success': True}), 200
+
+
+# ─── Password Reset ───────────────────────────────────────────────────────────
+
+@app.route('/reset-password', methods=['POST'])
+def reset_password():
+    data = request.json or {}
+    email = data.get('email', '').strip().lower()
+    password = data.get('password', '')
+
+    if not email or not password:
+        return jsonify({'error': 'Email and password are required'}), 400
+
+    result = table.scan(FilterExpression=Attr('email').eq(email))
+    items = result.get('Items', [])
+    if not items:
+        return jsonify({'error': 'No account found with this email'}), 404
+
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    table.update_item(
+        Key={'userId': items[0]['userId']},
+        UpdateExpression='SET passwordHash = :ph',
+        ExpressionAttributeValues={':ph': password_hash},
+    )
+
+    return jsonify({'success': True}), 200
+
+
+# ─── HSC Analytics ────────────────────────────────────────────────────────────
+
+@app.route('/hsc-data', methods=['GET'])
+def get_hsc_data():
+    try:
+        items = []
+        result = hsc_table.scan()
+        items.extend(result.get('Items', []))
+        while 'LastEvaluatedKey' in result:
+            result = hsc_table.scan(ExclusiveStartKey=result['LastEvaluatedKey'])
+            items.extend(result.get('Items', []))
+
+        districts, boards, national = {}, {}, {}
+        for item in items:
+            pk = item.get('pk', '')
+            sk = item.get('sk', '')
+            if not pk or not sk or '#' not in sk:
+                continue
+            year, group = sk.split('#', 1)
+            if group != 'All Groups':
+                continue
+            pct = item.get('overall_pass_pct')
+            if pct is None:
+                continue
+            pct = float(pct)
+
+            if pk == 'National':
+                national[year] = pct
+            elif pk.endswith(' Board Total'):
+                bname = pk[: -len(' Board Total')]
+                boards.setdefault(bname, {})[year] = pct
+            else:
+                if pk not in districts:
+                    districts[pk] = {'board': str(item.get('board', ''))}
+                districts[pk][year] = pct
+
+        return jsonify({'districts': districts, 'boards': boards, 'national': national}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':
